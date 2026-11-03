@@ -3,7 +3,7 @@
 from copy import deepcopy
 import unittest
 
-from ai_flows.flow import Flow, FlowError, marker, read_marker, validate_config
+from ai_flows.flow import Flow, FlowError, digest, marker, read_marker, validate_config
 
 
 REPO = "owner/project"
@@ -48,8 +48,17 @@ class MemoryGitHub:
         self.reads = []
         self.before_api = None
         self.before_pages = None
+        self.canonical_full_name = REPO
+
+    @staticmethod
+    def normalize_path(path):
+        parts = path.split("/", 3)
+        if len(parts) >= 3 and parts[0] == "repos" and f"{parts[1]}/{parts[2]}".casefold() == REPO.casefold():
+            parts[1], parts[2] = REPO.split("/")
+        return "/".join(parts)
 
     def api(self, path, *, method="GET", payload=None):
+        path = self.normalize_path(path)
         if self.before_api:
             self.before_api(path, method, payload)
         self.reads.append((path, method))
@@ -57,6 +66,8 @@ class MemoryGitHub:
             self.writes.append((path, method, deepcopy(payload)))
         if path == "user":
             return {"login": self.login}
+        if path == f"repos/{REPO}":
+            return {"full_name": self.canonical_full_name}
         relative = path.removeprefix(f"repos/{REPO}/")
         pieces = relative.split("/")
         if relative == "issues" and method == "POST":
@@ -101,6 +112,7 @@ class MemoryGitHub:
         raise AssertionError(f"Unexpected API request: {method} {path}")
 
     def pages(self, path, *, field=None, params=None):
+        path = self.normalize_path(path)
         if self.before_pages:
             self.before_pages(path, field, params)
         self.reads.append((path, "PAGES"))
@@ -109,8 +121,8 @@ class MemoryGitHub:
         if relative == "issues":
             return deepcopy(list(self.issues.values()))
         if relative == "pulls":
-            branch = params["head"].split(":", 1)[1]
-            return deepcopy([value for value in self.pulls.values() if value["head"]["ref"] == branch])
+            branch = params["head"].split(":", 1)[1] if params and "head" in params else None
+            return deepcopy([value for value in self.pulls.values() if branch is None or value["head"]["ref"] == branch])
         if len(pieces) == 3 and pieces[0] == "pulls" and pieces[2] == "reviews":
             return deepcopy(self.reviews.get(int(pieces[1]), []))
         if len(pieces) == 3 and pieces[0] == "issues" and pieces[2] == "comments":
@@ -396,6 +408,128 @@ class WorkflowTest(unittest.TestCase):
     def test_embedded_marker_is_not_authoritative(self):
         body = marker("run", {"attacker": True}) + "\nHuman text follows."
         self.assertIsNone(read_marker(body, "run"))
+
+    def test_recovered_task_cannot_create_another_pr_with_a_different_branch(self):
+        issue, pr = self.task_pr()
+        with self.assertRaisesRegex(FlowError, "branch"):
+            self.flow.open_pr(issue_number=issue, branch="ai/issue-1-recovered", base="main")
+        self.assertEqual(list(self.github.pulls), [pr])
+
+    def test_closed_task_pr_cannot_be_replaced_on_a_new_branch(self):
+        issue, pr = self.task_pr()
+        self.github.pulls[pr]["state"] = "closed"
+        with self.assertRaisesRegex(FlowError, "closed"):
+            self.flow.open_pr(issue_number=issue, branch="ai/issue-1-replacement", base="main")
+        self.assertEqual(len(self.github.pulls), 1)
+
+    def test_duplicate_task_identity_across_branches_requires_reconciliation(self):
+        issue, pr = self.task_pr()
+        duplicate = deepcopy(self.github.pulls[pr])
+        duplicate["number"] = 77
+        duplicate["head"]["ref"] = "ai/duplicate-task"
+        self.github.pulls[77] = duplicate
+        with self.assertRaisesRegex(FlowError, "Multiple|Duplicate"):
+            self.flow.open_pr(issue_number=issue, branch=f"ai/issue-{issue}-task", base="main")
+        self.assertEqual(len(self.github.pulls), 2)
+
+    def test_unrelated_fork_branch_name_does_not_conflict_with_task_branch(self):
+        issue = self.start()["issue"]
+        self.github.pulls[77] = {
+            "number": 77, "state": "open", "body": "Unrelated fork contribution.",
+            "html_url": "pull/77", "head": {"ref": "ai/issue-1-task", "repo": {"full_name": "outsider/project"}},
+        }
+        created = self.flow.open_pr(issue_number=issue, branch="ai/issue-1-task", base="main")
+        self.assertFalse(created["reused"])
+        self.assertEqual(len(self.github.pulls), 2)
+
+    def test_deleted_head_repository_fails_with_workflow_diagnostic(self):
+        _, pr = self.task_pr()
+        self.github.pulls[pr]["head"]["repo"] = None
+        with self.assertRaisesRegex(FlowError, "same-repository"):
+            self.flow.context(pr)
+
+    def test_same_sha_failed_evidence_can_refresh_without_another_fix_round(self):
+        _, pr = self.task_pr(max_fix_rounds=0)
+        failed = report()
+        failed["test_evidence"][0].update(passed=False, summary="CI is not finished.")
+        original = self.flow.publish_review(number=pr, report=failed)
+        self.github.pass_checks()
+        pending = self.flow.status(pr)
+        self.assertEqual(pending["next_round"], 1)
+        self.assertEqual(pending["state"], "needs_fix")
+        refreshed = self.flow.publish_review(number=pr, report=report())
+        self.assertFalse(refreshed["reused"])
+        self.assertEqual(len(self.github.reviews[pr]), 2)
+        status = self.flow.status(pr)
+        self.assertEqual(status["state"], "ready")
+        self.assertEqual(status["round"], 1)
+        self.assertEqual(status["max_fix_rounds"], 0)
+        writes = len(self.github.writes)
+        self.assertEqual(self.flow.publish_review(number=pr, report=failed)["review_url"], original["review_url"])
+        self.assertTrue(self.flow.publish_review(number=pr, report=report())["reused"])
+        self.assertEqual(len(self.github.writes), writes)
+        self.assertEqual(self.flow.status(pr)["state"], "ready")
+
+    def test_refresh_cannot_remove_blockers_or_drop_acceptance_or_tests(self):
+        for mutation in ("blocker", "acceptance", "test", "regression", "round"):
+            with self.subTest(mutation=mutation):
+                self.setUp()
+                _, pr = self.task_pr()
+                failed = report(blocking=mutation == "blocker")
+                failed["test_evidence"][0].update(passed=False, summary="Environment unavailable.")
+                failed["acceptance_checks"].append({"criterion": "Second criterion", "passed": True, "evidence": "Checked."})
+                failed["test_evidence"].append({"command": "second-test", "passed": True, "summary": "Passed."})
+                self.flow.publish_review(number=pr, report=failed)
+                refreshed = deepcopy(failed)
+                refreshed["test_evidence"][0].update(passed=True, summary="Reran successfully.")
+                if mutation == "blocker":
+                    refreshed["blocking_findings"] = []
+                elif mutation == "acceptance":
+                    refreshed["acceptance_checks"].pop()
+                elif mutation == "test":
+                    refreshed["test_evidence"].pop()
+                elif mutation == "regression":
+                    refreshed["acceptance_checks"][1]["passed"] = False
+                else:
+                    refreshed["round"] = 2
+                with self.assertRaises(FlowError):
+                    self.flow.publish_review(number=pr, report=refreshed)
+                self.assertEqual(len(self.github.reviews[pr]), 1)
+
+    def test_refreshed_evidence_preserves_round_sequence_for_next_commit(self):
+        _, pr = self.task_pr()
+        failed = report()
+        failed["acceptance_checks"][0].update(passed=False, evidence="External system unavailable.")
+        self.flow.publish_review(number=pr, report=failed)
+        self.flow.publish_review(number=pr, report=report())
+        self.github.pulls[pr]["head"]["sha"] = NEW_SHA
+        self.assertEqual(self.flow.status(pr)["next_round"], 2)
+        self.flow.publish_review(number=pr, report=report(NEW_SHA, 2))
+        self.github.pass_checks(NEW_SHA)
+        self.assertEqual(self.flow.status(pr)["round"], 2)
+        self.assertEqual(self.flow.status(pr)["state"], "ready")
+
+    def test_repository_case_variants_share_task_key_and_pr_context(self):
+        first = self.start()
+        variant = Flow(self.github, "Owner/Project")
+        second = variant.start(key="task-001", title="Implement task", task="Fix the actual behavior.", plan="Add a regression check and make it pass.", config=deepcopy(CONFIG))
+        self.assertEqual(first["issue"], second["issue"])
+        self.assertEqual(len(self.github.issues), 1)
+        pr = self.flow.open_pr(issue_number=first["issue"], branch="ai/issue-1-task", base="main")["pr"]
+        self.assertEqual(variant.context(pr)[0]["number"], pr)
+        self.assertTrue(variant.open_pr(issue_number=first["issue"], branch="ai/issue-1-task", base="main")["reused"])
+
+    def test_canonical_repository_spelling_preserves_existing_run_identity(self):
+        self.github.canonical_full_name = "Owner/Project"
+        original = Flow(self.github, "Owner/Project")
+        started = original.start(key="task-001", title="Implement task", task="Fix the actual behavior.", plan="Add a regression check and make it pass.", config=deepcopy(CONFIG))
+        issue = started["issue"]
+        self.assertEqual(read_marker(self.github.issues[issue]["body"], "run")["key"], digest("Owner/Project\ntask-001"))
+        pr = original.open_pr(issue_number=issue, branch="ai/issue-1-task", base="main")["pr"]
+        original.publish_review(number=pr, report=report(blocking=True))
+        restored = self.start()
+        self.assertEqual(restored["issue"], issue)
+        self.assertEqual(self.flow.status(pr)["round"], 1)
 
 
 if __name__ == "__main__":

@@ -4,7 +4,6 @@ import base64
 import hashlib
 import json
 import re
-from urllib.parse import quote
 
 from .reports import ReportError, render_review, validate_report
 
@@ -103,8 +102,13 @@ class Flow:
         if not isinstance(key, str) or not key.strip():
             raise FlowError("A stable nonempty task key is required")
         validate_config(config)
+        repository = self.github.api(self.root)
+        canonical = repository.get("full_name") if isinstance(repository, dict) else None
+        if not isinstance(canonical, str) or canonical.casefold() != self.repo.casefold():
+            raise FlowError("Cannot establish the canonical GitHub repository identity")
         return {
-            "key": digest(f"{self.repo}\n{key}"),
+            # GitHub's canonical spelling retains already-published run identities.
+            "key": digest(f"{canonical}\n{key}"),
             "task_digest": task_digest,
             "coordinator": self.actor(),
             **config,
@@ -158,18 +162,36 @@ class Flow:
         if not branch or branch == base:
             raise FlowError("Use a separate nonempty task branch")
         expected = {"issue": issue_number, "run_key": meta["key"]}
-        found = self.github.pages(
-            f"{self.root}/pulls", params={"state": "all", "head": f"{self.repo.split('/')[0]}:{branch}"}
-        )
-        if len(found) > 1:
-            raise FlowError("Multiple PRs use this task branch; reconcile manually")
-        if found:
-            item = found[0]
-            if read_marker(item.get("body"), "pr") != expected:
-                raise FlowError("Branch already belongs to an unrelated PR")
+        task_pulls = []
+        branch_pulls = []
+        for item in self.github.pages(f"{self.root}/pulls", params={"state": "all"}):
+            head = item.get("head") or {}
+            repository = head.get("repo") or {}
+            full_name = repository.get("full_name")
+            same_repository = isinstance(full_name, str) and full_name.casefold() == self.repo.casefold()
+            identity = read_marker(item.get("body"), "pr")
+            if identity and (identity.get("issue") == issue_number or identity.get("run_key") == meta["key"]):
+                if identity != expected or type(identity.get("issue")) is not int:
+                    raise FlowError("Task PR identity conflicts with its Issue; reconcile manually")
+                if not same_repository:
+                    raise FlowError("Task PR is not on a same-repository branch; reconcile manually")
+                task_pulls.append(item)
+            if same_repository and head.get("ref") == branch:
+                branch_pulls.append(item)
+        if len(task_pulls) > 1:
+            raise FlowError("Multiple PRs belong to this task; reconcile manually")
+        if task_pulls:
+            item = task_pulls[0]
             if item.get("state") != "open":
                 raise FlowError("Task PR is closed; do not silently create a replacement")
-            return {"pr": item["number"], "url": item["html_url"], "reused": True}
+            original_branch = item.get("head", {}).get("ref")
+            if branch != original_branch:
+                raise FlowError(f"Task already has PR #{item['number']} on branch {original_branch}; continue that original branch")
+            if len(branch_pulls) != 1:
+                raise FlowError("Multiple PRs use this task branch; reconcile manually")
+            return {"pr": item["number"], "url": item["html_url"], "branch": original_branch, "reused": True}
+        if branch_pulls:
+            raise FlowError("Branch already belongs to an unrelated PR")
         content = f"{body.strip()}\n\nCloses #{issue_number}\n\n{marker('pr', expected)}"
         if len(content) > 60000:
             raise FlowError("PR body exceeds the workflow limit")
@@ -177,7 +199,7 @@ class Flow:
             "title": issue["title"], "head": branch, "base": base,
             "body": content, "draft": True,
         })
-        return {"pr": result["number"], "url": result["html_url"], "reused": False}
+        return {"pr": result["number"], "url": result["html_url"], "branch": branch, "reused": False}
 
     def _require_actor(self, meta):
         if self.actor() != meta["coordinator"]:
@@ -193,8 +215,10 @@ class Flow:
         issue, meta = self.issue(identity["issue"])
         if issue.get("state") != "open" or identity["run_key"] != meta["key"]:
             raise FlowError("PR and task Issue identities do not match an open run")
-        head = pr.get("head", {})
-        if head.get("repo", {}).get("full_name") != self.repo:
+        head = pr.get("head") or {}
+        head_repository = head.get("repo") or {}
+        head_repo = head_repository.get("full_name")
+        if not isinstance(head_repo, str) or head_repo.casefold() != self.repo.casefold():
             raise FlowError("Only same-repository task branches are supported")
         if not re.fullmatch(r"[0-9a-f]{40}", head.get("sha", "")):
             raise FlowError("PR has an invalid HEAD SHA")
@@ -217,12 +241,39 @@ class Flow:
                 raise FlowError(f"Stored review is invalid: {error}") from error
             if item.get("commit_id") != report["reviewed_commit_sha"]:
                 raise FlowError("Review commit differs from its recorded SHA")
-            if report["round"] != len(records) + 1:
-                raise FlowError("Review rounds are duplicated or out of order; reconcile manually")
             if report["round"] > meta["max_fix_rounds"] + 1:
                 raise FlowError("Stored review exceeds the configured round limit")
-            records.append({"report": report, "url": item["html_url"]})
+            version = {"report": report, "url": item["html_url"]}
+            if report["round"] == len(records) + 1:
+                if records and records[-1]["report"]["reviewed_commit_sha"] == report["reviewed_commit_sha"]:
+                    raise FlowError("A new review round requires a new commit")
+                records.append({**version, "versions": [version]})
+            elif records and report["round"] == len(records) and self._evidence_refresh(records[-1]["report"], report):
+                records[-1]["versions"].append(version)
+                records[-1].update(version)
+            else:
+                raise FlowError("Review rounds are duplicated or out of order; reconcile manually")
         return records
+
+    @staticmethod
+    def _evidence_refresh(previous, current):
+        """Allow only verified progress on unchanged evidence obligations."""
+        if (
+            previous["reviewed_commit_sha"] != current["reviewed_commit_sha"]
+            or previous["round"] != current["round"]
+            or previous["blocking_findings"] or current["blocking_findings"]
+        ):
+            return False
+        improved = False
+        for category, identity in (("acceptance_checks", "criterion"), ("test_evidence", "command")):
+            before, after = previous[category], current[category]
+            if len(before) != len(after):
+                return False
+            for old, new in zip(before, after):
+                if old[identity] != new[identity] or (old["passed"] and not new["passed"]):
+                    return False
+                improved |= not old["passed"] and new["passed"]
+        return improved
 
     def _pause(self, number, meta):
         comments = self.github.pages(f"{self.root}/issues/{number}/comments")
@@ -243,15 +294,19 @@ class Flow:
             raise FlowError("Stale review: reviewer must inspect the current PR HEAD")
         records = self.reviews(number, meta)
         for saved in records:
-            if saved["report"] == report:
-                return {"review_url": saved["url"], "round": report["round"], "reused": True}
-        if report["round"] != len(records) + 1:
+            for version in saved["versions"]:
+                if version["report"] == report:
+                    return {"review_url": version["url"], "round": report["round"], "reused": True}
+        refreshing = bool(records and records[-1]["report"]["reviewed_commit_sha"] == report["reviewed_commit_sha"])
+        if refreshing:
+            if not self._evidence_refresh(records[-1]["report"], report):
+                raise FlowError("No new commit; only a same-round monotonic evidence refresh without blockers is allowed")
+        elif report["round"] != len(records) + 1:
             raise FlowError("Report round must be the next consecutive review round")
         if report["round"] > meta["max_fix_rounds"] + 1:
             raise FlowError("Review limit reached; pause and request human judgment")
-        if records and records[-1]["report"]["reviewed_commit_sha"] == report["reviewed_commit_sha"]:
-            raise FlowError("No new commit since the last review; do not spend another round")
-        text = render_review(report) + "\n\n" + marker("review", {"run_key": meta["key"], "report": report})
+        heading = "## 同提交证据刷新，不新增修复轮次\n\n" if refreshing else ""
+        text = heading + render_review(report) + "\n\n" + marker("review", {"run_key": meta["key"], "report": report})
         if len(text) > 60000:
             raise FlowError("Rendered review exceeds 60000 characters")
         # A second read catches branch changes during report preparation.
@@ -310,7 +365,9 @@ class Flow:
             if len(records) >= meta["max_fix_rounds"] + 1:
                 result.update(state="limit_reached", reason="No review rounds remain for the new HEAD")
         elif self._unmet(latest):
-            if len(records) >= meta["max_fix_rounds"] + 1:
+            if not latest["blocking_findings"]:
+                result.update(state="needs_fix", next_round=latest["round"], reason="Revalidate failed evidence at the same SHA and round; preserve all acceptance and test obligations")
+            elif len(records) >= meta["max_fix_rounds"] + 1:
                 result.update(state="limit_reached", reason="Review limit reached with unmet requirements")
             else:
                 result.update(state="needs_fix", reason="Resolve blocking findings or failed acceptance/test evidence")
