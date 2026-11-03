@@ -1,0 +1,4 @@
+{
+  "required_checks": ["unit-tests", "workflow-validation"],
+  "max_fix_rounds": 3
+}
